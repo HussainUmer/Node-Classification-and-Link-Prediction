@@ -1,0 +1,65 @@
+CREATE INDEX FOR (a:Author) ON (a.AuthorID);
+CREATE INDEX FOR (p:Paper) ON (p.PaperID);
+CREATE INDEX FOR (t:Topic) ON (t.TopicID);
+CREATE INDEX FOR (j:Journal) ON (j.JournalName);
+
+
+// Create Author nodes
+LOAD CSV WITH HEADERS FROM 'file:///author.csv' AS row
+MERGE (a:Author {AuthorID: row.AuthorID})
+SET a.AuthorName = row.AuthorName, a.AuthorURL = row.AuthorURL;
+
+
+// Create Paper nodes
+CALL apoc.periodic.iterate(
+    "LOAD CSV WITH HEADERS FROM 'file:///paper.csv' AS row Return row",
+    "MERGE (p:Paper {PaperID: row.PaperID})
+    SET p.DOI = row.PaperDOI, p.Title = row.PaperTitle, p.Year = row.PaperYear, p.URL = row.PaperURL,
+        p.CitationCount = toInteger(row.PaperCitationCount), 
+        p.FieldsOfStudy = row.FieldsofStudy, p.JournalVolume = row.JournalVolume, 
+        p.JournalDate = row.JournalDate",
+    {batchSize : 10000, parallel : false})
+
+
+// Create Topic nodes
+LOAD CSV WITH HEADERS FROM 'file:///topic.csv' AS row
+MERGE (t:Topic {TopicID: row.TopicID})
+SET t.TopicName = row.TopicName, t.TopicURL = row.TopicURL;
+
+
+// Create Journal nodes
+LOAD CSV WITH HEADERS FROM 'file:///journal.csv' AS row
+MERGE (j:Journal {JournalName: row.JournalName, Publisher: row.JournalPublisher});
+
+
+// Create AUTHORED_BY relationships between authors and papers
+LOAD CSV WITH HEADERS FROM 'file:///author_paper.csv' AS row
+MATCH (a:Author {AuthorID: row.AuthorID}), (p:Paper {PaperID: row.PaperID})
+MERGE (a)-[:AUTHORED_BY]->(p);
+
+
+// Create CO_AUTHORS relationships between authors who co-authored the same paper
+MATCH (a1:Author)-[:AUTHORED_BY]->(p:Paper)<-[:AUTHORED_BY]-(a2:Author)
+WHERE a1.AuthorID <> a2.AuthorID  // Ensure they are different authors
+MERGE (a1)-[:CO_AUTHORS]->(a2);
+
+
+// Create ASSOCIATED_WITH_TOPIC relationships between papers and topics
+LOAD CSV WITH HEADERS FROM 'file:///paper_topic.csv' AS row
+MATCH (p:Paper {PaperID: row.PaperID}), (t:Topic {TopicID: row.TopicID})
+MERGE (p)-[:ASSOCIATED_WITH_TOPIC]->(t);
+
+
+// Create CITES relationships between papers
+CALL apoc.periodic.iterate(
+    // Create CITES relationships between papers
+    "LOAD CSV WITH HEADERS FROM 'file:///paper_reference.csv' AS row Return row",
+   "MATCH (p1:Paper {PaperID: row.PaperID}), (p2:Paper {PaperID: row.ReferencedPaperID})
+    MERGE (p1)-[:CITES]->(p2)",
+    {batchSize : 10000 , parallel : false})
+
+
+// Create PUBLISHED_IN relationships between papers and journals
+LOAD CSV WITH HEADERS FROM 'file:///paper_journal.csv' AS row
+MATCH (p:Paper {PaperID: row.PaperID}), (j:Journal {JournalName: row.JournalName})
+MERGE (p)-[:PUBLISHED_IN]->(j);
