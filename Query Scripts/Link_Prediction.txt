@@ -1,0 +1,52 @@
+CALL gds.graph.project(
+'predictionGraph',['Author'],
+[{CO_AUTHORS: {orientation: 'UNDIRECTED', properties:['count']}}, {SHARED_TOPICS: {orientation: 'UNDIRECTED'}}]
+);
+
+Call gds.beta.pipeline.linkPrediction.create('Linkpipeline')
+
+Call gds.beta.pipeline.linkPrediction.addNodeProperty('Linkpipeline','fastRP',{mutateProperty: 'embedding', embeddingDimension: 56, randomSeed: 42})
+
+Call gds.beta.pipeline.linkPrediction.addNodeProperty('Linkpipeline', 'degree', {mutateProperty: 'degree'})
+
+Call gds.beta.pipeline.linkPrediction.addNodeProperty('Linkpipeline', 'alpha.scaleProperties', {nodeProperties: ['degree'], mutateProperty: 'scaledDegree', scaler: 'MinMax'})
+
+Call gds.beta.pipeline.linkPrediction.addFeature('Linkpipeline', 'HADAMARD', {nodeProperties: ['embedding']})
+
+Call gds.beta.pipeline.linkPrediction.addFeature('Linkpipeline', 'HADAMARD', {nodeProperties: ['scaledDegree']})
+
+Call gds.beta.pipeline.linkPrediction.configureSplit('Linkpipeline', {testFraction: 0.2, trainFraction: 0.2, validationFolds: 3})
+
+CALL gds.beta.pipeline.linkPrediction.addRandomForest(
+  'Linkpipeline',
+  {
+    numberOfDecisionTrees: 10
+  }
+);
+
+CALL gds.beta.pipeline.linkPrediction.train(
+  'predictionGraph', 
+  {
+    pipeline: 'Linkpipeline', 
+    modelName: 'Linkmodel', 
+    targetRelationshipType: 'CO_AUTHORS',
+    metrics: ['AUCPR'], 
+    randomSeed: 42
+  }
+)
+
+CALL gds.beta.pipeline.linkPrediction.predict.stream(
+  'predictionGraph',
+  {
+    modelName: 'Linkmodel',
+    topN: 50,
+    threshold: 0.3
+  }
+) YIELD node1, node2, probability
+MATCH (a1:Author) WHERE id(a1) = node1
+MATCH (a2:Author) WHERE id(a2) = node2
+RETURN 
+  a1.AuthorID AS author1,
+  a2.AuthorID AS author2,
+  probability AS collaborationScore
+ORDER BY probability DESC;
