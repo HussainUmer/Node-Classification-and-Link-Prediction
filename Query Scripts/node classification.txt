@@ -1,0 +1,368 @@
+After making nodes and relationships:
+
+
+MATCH (j:Journal)<-[:PUBLISHED_IN]-(p:Paper)
+WHERE p.fieldsofstudy IS NOT NULL AND p.fieldsofstudy <> ''
+WITH j, p.fieldsofstudy AS field, COUNT(*) AS count
+ORDER BY j.journalname, count DESC
+WITH j, COLLECT(field)[0] AS most_common_field
+SET j.subject_category = most_common_field;
+
+
+MATCH (j:Journal)
+WITH COLLECT(DISTINCT j.subject_category) AS categories
+UNWIND range(0, size(categories)-1) AS categoryId
+WITH categories[categoryId] AS category, categoryId
+MATCH (j:Journal {subject_category: category})
+SET j.subject_category_id = categoryId;
+
+
+
+// Count the number of papers published in each journal
+MATCH (j:Journal)<-[:PUBLISHED_IN]-(p:Paper)
+WITH j, count(p) AS paperCount
+SET j.paperCount = paperCount;
+
+// Calculate average citations per paper for each journal
+MATCH (j:Journal)<-[:PUBLISHED_IN]-(p:Paper)
+WITH j, avg(toInteger(coalesce(p.citationcount, '0'))) AS avgCitations
+SET j.avgCitations = avgCitations;
+
+// Calculate citation diversity (number of unique topics cited)
+MATCH (j:Journal)<-[:PUBLISHED_IN]-(p:Paper)-[:CITES]->(cited:Paper)-[:ASSOCIATED_WITH_TOPIC]->(t:Topic)
+WITH j, count(DISTINCT t) AS topicDiversity
+SET j.topicDiversity = topicDiversity;
+
+// Calculate self-citation ratio
+MATCH (j:Journal)<-[:PUBLISHED_IN]-(p:Paper)-[:CITES]->(cited:Paper)-[:PUBLISHED_IN]->(citedJ:Journal)
+WITH j, count(cited) AS totalCitations,
+     sum(CASE WHEN j.journalname = citedJ.journalname THEN 1 ELSE 0 END) AS selfCitations
+WITH j, CASE WHEN totalCitations > 0 THEN 1.0 * selfCitations / totalCitations ELSE 0 END AS selfCitationRatio
+SET j.selfCitationRatio = selfCitationRatio;
+
+
+// Create topic distribution features
+MATCH (j:Journal)<-[:PUBLISHED_IN]-(p:Paper)-[:ASSOCIATED_WITH_TOPIC]->(t:Topic)
+WITH j, t.topicname AS topic, COUNT(*) AS count
+ORDER BY j, count DESC
+WITH j, COLLECT(count)[0..5] AS topTopics  
+SET j.top_topic_distribution = topTopics;
+
+
+
+// Initialize with zero values for all journals 
+MATCH (j:Journal)
+SET j.top_topic_distribution = CASE 
+  WHEN j.top_topic_distribution IS NULL THEN [0, 0, 0, 0, 0]
+  ELSE j.top_topic_distribution
+END;
+
+// Set paperCount = 0 for journals with no papers
+MATCH (j:Journal)
+WHERE NOT EXISTS { (j)<-[:PUBLISHED_IN]-(:Paper) }
+SET j.paperCount = 0;
+
+
+// Set avgCitations = 0 for journals with no papers
+MATCH (j:Journal)
+WHERE j.avgCitations IS NULL
+SET j.avgCitations = 0;
+
+
+// Set topicDiversity = 0 for journals with no topics
+MATCH (j:Journal)
+WHERE j.topicDiversity IS NULL
+SET j.topicDiversity = 0;
+
+
+// Set selfCitationRatio = 0 for journals with no citations
+MATCH (j:Journal)
+WHERE j.selfCitationRatio IS NULL
+SET j.selfCitationRatio = 0;
+
+MATCH (j:Journal)
+WHERE j.paperCount IS NULL
+SET j.paperCount = 0;
+
+
+MATCH (sourceJournal:Journal)<-[:PUBLISHED_IN]-(sourcePaper:Paper)-[:CITES]->(targetPaper:Paper)-[:PUBLISHED_IN]->(targetJournal:Journal)
+MERGE (sourceJournal)-[r:JOURNAL_CITES]->(targetJournal)
+ON CREATE SET r.weight = 1
+ON MATCH SET r.weight = r.weight + 1;
+
+
+// Add graph-based features 
+CALL gds.graph.project(
+  'journalFeatures',
+  'Journal',
+  {
+    JOURNAL_CITES: {
+      orientation: 'UNDIRECTED',
+      properties: 'weight'
+    }
+  }
+);
+
+
+// Calculate PageRank
+CALL gds.pageRank.write('journalFeatures', {
+  maxIterations: 50,
+  dampingFactor: 0.85,
+  writeProperty: 'pagerank'
+});
+
+
+// Calculate Louvain communities
+CALL gds.louvain.write('journalFeatures', {
+  writeProperty: 'community'
+});
+
+
+// Calculate Betweenness Centrality
+CALL gds.betweenness.write('journalFeatures', {
+  writeProperty: 'betweenness'
+});
+
+
+
+
+
+
+
+MATCH (j:Journal)
+WITH j, 
+     CASE WHEN j.paperCount = 0 THEN 0 ELSE LOG(j.paperCount) END AS log_papers,
+     j.avgCitations / 100.0 AS scaled_citations,  
+     j.topicDiversity / 50.0 AS scaled_diversity  
+SET j.feature_vector = [log_papers, scaled_citations, scaled_diversity, 
+                        j.pagerank, j.betweenness, j.selfCitationRatio];
+
+
+
+
+// Step 1: Collect journals grouped by subject_category_id 
+MATCH (j:Journal) 
+WHERE j.subject_category_id IS NOT NULL 
+WITH j, j.subject_category_id AS category 
+ORDER BY category, rand() 
+
+
+// Step 2: Collect journals per category and calculate split sizes 
+WITH category, collect(j) AS journals, count(j) AS cat_count 
+WITH category, journals, cat_count, 
+     toInteger(cat_count * 0.25) AS train_size, 
+     toInteger(cat_count * 0.25) AS test_size 
+WHERE train_size > 0 AND test_size > 0 
+
+
+// Step 3: Assign TRAIN labels 
+UNWIND range(0, train_size - 1) AS index 
+WITH category, journals, index, train_size, test_size 
+SET (journals[index]).split = 'TRAIN' 
+
+
+// Step 4: Assign TEST labels 
+WITH category, journals, train_size, test_size
+UNWIND range(train_size, train_size + test_size - 1) AS test_index 
+SET (journals[test_index]).split = 'TEST';
+
+
+CALL gds.graph.project.cypher(
+  'enhancedJournalGraph',
+  // Node query to select only TRAIN journals
+  'MATCH (j:Journal) WHERE j.split = "TRAIN" RETURN id(j) AS id, 
+   j.feature_vector AS feature_vector, 
+   j.subject_category_id AS subject_category_id, 
+   j.community AS community, 
+   j.top_topic_distribution AS top_topic_distribution',
+  // Relationship query with explicit type specification
+  'MATCH (j1:Journal)-[r:JOURNAL_CITES]->(j2:Journal) 
+   WHERE j1.split = "TRAIN" AND j2.split = "TRAIN" 
+   RETURN id(j1) AS source, id(j2) AS target, r.weight AS weight, "JOURNAL_CITES" AS type'
+);
+
+
+
+
+
+
+
+
+
+
+
+
+CALL gds.beta.pipeline.nodeClassification.create('enhancedPipeline');
+
+
+CALL gds.beta.pipeline.nodeClassification.addNodeProperty(
+  'enhancedPipeline',
+  'fastRP',
+  {
+    embeddingDimension: 64,
+    mutateProperty: 'embedding'
+  }
+)
+
+
+
+
+
+// Add feature selection
+CALL gds.beta.pipeline.nodeClassification.selectFeatures(
+  'enhancedPipeline',
+  ['feature_vector', 'embedding', 'top_topic_distribution']
+);
+
+
+
+CALL gds.beta.pipeline.nodeClassification.addLogisticRegression(
+  'enhancedPipeline',
+  {
+    maxEpochs: 500,
+    penalty: 0.001,
+    patience: 10
+  }
+);
+
+
+
+
+
+
+
+CALL gds.beta.pipeline.nodeClassification.train('enhancedJournalGraph', {
+  pipeline: 'enhancedPipeline',
+  modelName: 'enhancedJournalModel',
+  targetProperty: 'subject_category_id',
+  metrics: ['F1_WEIGHTED', 'ACCURACY'],
+  randomSeed: 42,
+  params: [
+    {penalty: 0.001, maxEpochs: 500},
+    {penalty: 0.01, maxEpochs: 1000}
+  ],
+  nodeLabels: ['Journal'],
+  relationshipTypes: ['JOURNAL_CITES']
+}) YIELD modelInfo
+RETURN 
+  modelInfo.bestParameters AS config,
+  modelInfo.metrics.F1_WEIGHTED.outerTrain AS trainF1;
+
+
+
+
+
+
+CALL gds.graph.project.cypher(
+  'testJournalGraph',
+  // Node query for TEST journals
+  'MATCH (j:Journal) WHERE j.split = "TEST" 
+   RETURN id(j) AS id, 
+   j.feature_vector AS feature_vector, 
+   j.subject_category_id AS subject_category_id, 
+   j.community AS community, 
+   j.top_topic_distribution AS top_topic_distribution',
+  // Relationship query for JOURNAL_CITES
+  'MATCH (j1:Journal)-[r:JOURNAL_CITES]->(j2:Journal)
+   WHERE j1.split = "TEST" AND j2.split = "TEST"
+   RETURN id(j1) AS source, id(j2) AS target, type(r) AS type'
+);
+
+
+
+CALL gds.beta.pipeline.nodeClassification.predict.stream(
+  'testJournalGraph', 
+  { 
+    modelName: 'enhancedJournalModel',
+    predictedProbabilityProperty: 'probability',
+    relationshipTypes: ['JOURNAL_CITES']
+  }
+) YIELD nodeId, predictedClass 
+WITH nodeId, predictedClass,
+     gds.util.nodeProperty('testJournalGraph', nodeId, 'subject_category_id') AS actualClass
+RETURN 
+  count(*) AS totalTestNodes, 
+  sum(CASE WHEN predictedClass = actualClass THEN 1 ELSE 0 END) AS correctPredictions, 
+  1.0 * sum(CASE WHEN predictedClass = actualClass THEN 1 ELSE 0 END) / count(*) AS accuracy;
+
+
+
+Random Forest Pipeline:
+
+// Create the node classification pipeline
+CALL gds.beta.pipeline.nodeClassification.create('enhancedPipeline');
+
+// Add FastRP node property for embeddings
+CALL gds.beta.pipeline.nodeClassification.addNodeProperty(
+  'enhancedPipeline',
+  'fastRP',
+  {
+    embeddingDimension: 64,
+    mutateProperty: 'embedding'
+  }
+);
+
+// Add feature selection
+CALL gds.beta.pipeline.nodeClassification.selectFeatures(
+  'enhancedPipeline',
+  ['feature_vector', 'embedding', 'top_topic_distribution']
+);
+
+// Add Random Forest model
+CALL gds.beta.pipeline.nodeClassification.addRandomForest(
+  'enhancedPipeline',
+  {
+    numberOfDecisionTrees: 100,
+    maxDepth: 10,
+    minSplitSize: 2
+  }
+);
+
+// Train the model on the enhancedJournalGraph
+CALL gds.beta.pipeline.nodeClassification.train('enhancedJournalGraph', {
+  pipeline: 'enhancedPipeline',
+  modelName: 'enhancedJournalModel',
+  targetProperty: 'subject_category_id',
+  metrics: ['F1_WEIGHTED', 'ACCURACY'],
+  randomSeed: 42,
+  params: [
+    {numberOfDecisionTrees: 100, maxDepth: 10, minSplitSize: 2},
+    {numberOfDecisionTrees: 50, maxDepth: 5, minSplitSize: 4}
+  ],
+  nodeLabels: ['Journal'],
+  relationshipTypes: ['JOURNAL_CITES']
+}) YIELD modelInfo
+RETURN 
+  modelInfo.bestParameters AS config,
+  modelInfo.metrics.F1_WEIGHTED.outerTrain AS trainF1;
+
+// Project the test graph for TEST journals
+CALL gds.graph.project.cypher(
+  'testJournalGraph',
+  'MATCH (j:Journal) WHERE j.split = "TEST" 
+   RETURN id(j) AS id, 
+   j.feature_vector AS feature_vector, 
+   j.subject_category_id AS subject_category_id, 
+   j.community AS community, 
+   j.top_topic_distribution AS top_topic_distribution',
+  'MATCH (j1:Journal)-[r:JOURNAL_CITES]->(j2:Journal)
+   WHERE j1.split = "TEST" AND j2.split = "TEST"
+   RETURN id(j1) AS source, id(j2) AS target, type(r) AS type'
+);
+
+// Predict on the test graph and compute accuracy
+CALL gds.beta.pipeline.nodeClassification.predict.stream(
+  'testJournalGraph', 
+  { 
+    modelName: 'enhancedJournalModel',
+    predictedProbabilityProperty: 'probability',
+    relationshipTypes: ['JOURNAL_CITES']
+  }
+) YIELD nodeId, predictedClass 
+WITH nodeId, predictedClass,
+     gds.util.nodeProperty('testJournalGraph', nodeId, 'subject_category_id') AS actualClass
+RETURN 
+  count(*) AS totalTestNodes, 
+  sum(CASE WHEN predictedClass = actualClass THEN 1 ELSE 0 END) AS correctPredictions, 
+  1.0 * sum(CASE WHEN predictedClass = actualClass THEN 1 ELSE 0 END) / count(*) AS accuracy;
+
